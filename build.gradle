@@ -1,0 +1,216 @@
+/**
+ * Project and subproject set up.
+ */
+
+repositories {
+    mavenCentral()
+}
+
+def javaProjects() {
+   return allprojects.findAll { it.name != rootProject.name && it.name != "ui" }
+}
+
+configure(javaProjects()) {
+    apply plugin: "eclipse"
+    apply plugin: "jacoco"
+    apply plugin: "java"
+    
+    repositories {
+        mavenCentral()
+    }
+
+    eclipse {
+        classpath {
+            downloadJavadoc=true
+            downloadSources=true
+        }
+    }
+    
+    dependencies {
+        testCompile "junit:junit:4.12"
+        testCompile "org.mockito:mockito-core:1.10.19"
+        testCompile "org.powermock:powermock-api-mockito:1.6.2"
+        testCompile "org.powermock:powermock-module-junit4:1.6.2"
+    }
+
+    jar.doFirst {
+        manifest {
+            attributes (
+                "Class-Path": configurations.compile.collect { it.getName() }.join(" ")
+            )
+        }
+    }
+    
+    // Enable doclint for javadoc quality control
+    tasks.withType(Javadoc) {
+        options.addStringOption('Xdoclint:all', '-quiet')
+    }
+    
+    task copyToLib(type: Copy) {
+        into "${buildDir}/libs"
+        from configurations.runtime
+    }
+
+    build.dependsOn(javadoc)
+    build.dependsOn(copyToLib)
+
+    clean.dependsOn(cleanEclipse)
+    clean.dependsOn(eclipseProject)
+    clean.dependsOn(eclipseClasspath)
+    clean.dependsOn(eclipseJdt)
+    eclipseProject.mustRunAfter(cleanEclipse)
+    eclipseClasspath.mustRunAfter(cleanEclipse)
+    eclipseJdt.mustRunAfter(cleanEclipse)
+}
+
+project(":ui") {
+    task build() {}
+    task clean() {}
+}
+
+/**
+ * Documentation tasks.
+ */
+
+task aggregateTestResults(type: TestReport) {
+    mustRunAfter javaProjects().build
+    destinationDir = file("${buildDir}/unitTests")
+    reportOn javaProjects().test
+}
+
+task aggregateJacocoResults(type: JacocoReport) {
+    dependsOn = javaProjects().test
+    mustRunAfter javaProjects().build
+    additionalSourceDirs = files(javaProjects().sourceSets.main.allSource.srcDirs)
+    sourceDirectories = files(javaProjects().sourceSets.main.allSource.srcDirs)
+    classDirectories = files(javaProjects().sourceSets.main.output)
+    executionData = files(javaProjects().jacocoTestReport.executionData)
+    jacocoClasspath = files(javaProjects().jacocoTestReport.jacocoClasspath)
+    reports {
+        csv.enabled = false
+        html.enabled = true
+        html.destination "${buildDir}/codeCoverage"
+        xml.enabled = false
+    }
+    onlyIf = {
+        true
+    }
+    doFirst {
+        executionData = files(executionData.findAll {
+            it.exists()
+        })
+    }
+}
+
+task aggregateJavadoc(type: Javadoc) {
+    mustRunAfter javaProjects().build
+    source javaProjects().sourceSets.main.allJava
+    classpath = files(javaProjects().sourceSets.main.compileClasspath)
+    destinationDir = file("${buildDir}/javadoc")
+    doLast {
+        delete "${buildDir}/tmp"
+    }
+}
+
+task documentation(dependsOn: [aggregateTestResults, aggregateJacocoResults, aggregateJavadoc]) {}
+
+/**
+ * Docker tasks.
+ */
+
+def runCommand(String dir, String command, String... parameters) {
+    def stdout = new ByteArrayOutputStream()
+    exec {
+        workingDir = dir
+        standardOutput = stdout
+        executable command
+        for (String parameter: parameters)
+            args parameter
+    }
+    return stdout.toString()
+}
+
+def getCwd() {
+    return System.getProperty("user.dir")
+}
+
+def runDockerCommand(String... parameters) {
+    return runCommand(getCwd(), "docker", *parameters)
+}
+
+def runComposeCommand(String... parameters) {
+    return runCommand(getCwd(), "docker-compose", "-p", "$project.name", *parameters)
+}
+
+task buildDocker() {
+    mustRunAfter subprojects.build
+    doLast {
+        runComposeCommand("pull")
+        runComposeCommand("build")
+    }
+}
+
+task cleanDocker << {
+    runComposeCommand("down", "-v")
+}
+
+/**
+ * Distribution tasks.
+ */
+
+def dockerImagesArchive = "images.tar.gz"
+
+def runComposeHelperCommand(String function, String... files) {
+    if (files.length == 0)
+        files = ["docker-compose.yml"]
+    return runCommand(getCwd(), "python", "-u", "compose-helper.py", function, *files)
+}
+
+task packageDocker(dependsOn: [buildDocker]) {
+    doLast {
+        def images = runComposeHelperCommand("images").split("\n")
+        runDockerCommand("save", "-o", "${buildDir}/$dockerImagesArchive", *images)
+    }
+}
+
+def getDate() {
+    def date = new Date()
+    def formattedDate = date.format('yyyyMMddHHmmss')
+    return formattedDate
+}
+
+task dist(type: Tar, dependsOn: [packageDocker]) {
+    mustRunAfter "build"
+
+    def composeFile = "docker-compose.yml"
+    doFirst {
+        def contents = runComposeHelperCommand("file")
+        new File("${buildDir}/$composeFile").write(contents, "UTF-8")
+    }
+    
+    baseName = "$rootProject.name"
+    version = getDate()
+    destinationDir = new File("${buildDir}")
+    compression = Compression.GZIP
+    from ("${buildDir}/$dockerImagesArchive",
+          "${buildDir}/$composeFile",
+          "${projectDir}/.env",
+          "install/install.sh",
+          "install/README.md")
+    
+    doLast {
+        delete "${buildDir}/$dockerImagesArchive", "${buildDir}/$composeFile"
+    }
+}
+
+/**
+ * Overall project tasks.
+ */
+
+task clean(type: Delete, dependsOn: [subprojects.clean, cleanDocker]) {
+    delete "${buildDir}"
+}
+
+task build(dependsOn: [subprojects.build, documentation, buildDocker]) {
+    mustRunAfter clean
+}

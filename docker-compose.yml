@@ -1,0 +1,22 @@
+version: '2'
+
+services:
+  api:
+    build: api
+    links:
+      - db
+    ports:
+      - 8081:8081
+  db:
+    build: api/src/main/java/fa/gb/repository/script
+    volumes:
+      - db-data:/var/lib/postgresql/data
+  ui:
+    build: ui
+    links:
+      - api
+    ports:
+      - $UI_PORT:80
+
+volumes:
+  db-data: {}
